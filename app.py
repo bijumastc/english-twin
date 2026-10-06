@@ -15,6 +15,7 @@ Storage: Google Sheets (tabs Summary, Logins, Passages, Attempts, Drafts) or loc
 import html
 import json
 import random
+import re
 import time
 import uuid
 from datetime import datetime
@@ -41,10 +42,16 @@ def secret(name, default=None):
 
 
 DEFAULT_ROSTER = {"24": "Alex Mercer", "1": "Test Student"}
-ROSTER = {str(k).strip(): str(v).strip() for k, v in dict(secret("roster", DEFAULT_ROSTER)).items()}
+def clean_roll(r):
+    return str(r).strip().upper().replace(" ", "")
+
+
+ROSTER = {clean_roll(k): str(v).strip() for k, v in dict(secret("roster", DEFAULT_ROSTER)).items()}
 TEACHER_PASSWORD = str(secret("TEACHER_PASSWORD", "admin123"))
 GEMINI_MODEL = str(secret("GEMINI_MODEL", "gemini-3.5-flash-lite"))
-FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash"]
+# All of these have a free tier, each with its own separate limit.
+FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash",
+                   "gemini-3.8-flash"]
 
 LEVELS = [60, 80, 100, 120, 150, 200]
 LEVEL_NAMES = ["Starter", "Elementary", "Pre-Intermediate", "Intermediate", "Upper-Intermediate", "Advanced"]
@@ -81,6 +88,37 @@ PRACTICE_TOPICS = [
     {"label": "Management", "brief": "people at work in Kerala: teamwork, planning, a manager's decision, customer service, time management"},
 ]
 
+# Names: modern, neutral first names only — no caste surnames, no strongly religious names.
+NEUTRAL_NAMES = [
+    "Anu", "Rahul", "Neha", "Nikhil", "Diya", "Riya", "Tara", "Kiran", "Nila", "Varun", "Megha", "Sneha",
+    "Amal", "Asha", "Akhil", "Anjali", "Nithin", "Reshma", "Roshan", "Navya", "Sona", "Teena", "Vinay",
+    "Aditya", "Meera", "Arun", "Divya", "Sanjay", "Nisha", "Jithin", "Ammu", "Rohan", "Kavya", "Vivek",
+    "Neethu", "Sachin", "Sruthi", "Abhi", "Aswin", "Jyothi", "Manu", "Nayana", "Pranav",
+    "Remya", "Sandeep", "Swathy", "Tina", "Vipin", "Aleena", "Faiz", "Sana", "Ashwin", "Lekha",
+]
+CASTE_MARKERS = [
+    "Nair", "Menon", "Pillai", "Namboothiri", "Namboodiri", "Nambiar", "Kurup", "Panicker", "Panikkar",
+    "Warrier", "Varma", "Varier", "Iyer", "Iyengar", "Potti", "Moothathu", "Kaimal", "Thampi", "Thampuran",
+    "Ezhava", "Thiyya", "Nadar", "Chettiar", "Unnithan", "Marar", "Pisharody", "Embranthiri", "Tharakan",
+    "Mannadiar", "Nambeesan", "Namboothiripad", "Kartha", "Kurukkal", "Sharma", "Brahmin",
+]
+CASTE_RE = re.compile(r"\b(" + "|".join(CASTE_MARKERS) + r")\b", re.IGNORECASE)
+KERALA_PLACES = [
+    "Kochi", "Thrissur", "Kozhikode", "Palakkad", "Kollam", "Kannur", "Alappuzha", "Kottayam", "Malappuram",
+    "Thiruvananthapuram", "Kasaragod", "Pathanamthitta", "Idukki", "Wayanad", "Ernakulam", "Kakkanad",
+    "Munnar", "Varkala", "Kumarakom", "a small town in Kerala", "a village in Kerala",
+]
+FORMATS = [
+    "a short story", "a newspaper-style report", "a case study", "a profile of a person or business",
+    "a conversation retold in prose", "an email or letter", "a blog post", "a short opinion piece",
+]
+ANGLES = [
+    "a decision that has to be made", "an unexpected problem", "two people who disagree",
+    "a surprising number or result", "a mistake and what was learned from it", "a new idea being tested",
+    "a change that affects customers", "a comparison between two options", "a small success and its cause",
+    "a risk that someone noticed early",
+]
+
 SKILLS = {"analysis": "Analysis & inference", "vocabulary": "Vocabulary in context",
           "evaluation": "Critical thinking", "writing": "Written English"}
 
@@ -105,7 +143,8 @@ PASSAGE_COLS = ["timestamp", "roll", "name", "passage_id", "phase", "stage", "at
                 "evaluation", "writing", "next_level_idx", "language_issues", "duration_min", "passage"]
 LOGIN_COLS = ["timestamp", "roll", "name", "event", "session_id", "detail"]
 DRAFT_COLS = ["timestamp", "roll", "passage_id", "state"]
-TABLES = {"Logins": LOGIN_COLS, "Passages": PASSAGE_COLS, "Attempts": ATTEMPT_COLS, "Drafts": DRAFT_COLS}
+BANK_COLS = ["timestamp", "bank_id", "phase", "stage", "level_idx", "words", "topic", "focus", "title", "pack"]
+TABLES = {"Logins": LOGIN_COLS, "Passages": PASSAGE_COLS, "Attempts": ATTEMPT_COLS, "Drafts": DRAFT_COLS, "Bank": BANK_COLS}
 
 CHEERS = [
     "Every passage you read makes the next one easier. 💪",
@@ -401,8 +440,17 @@ def friendly(err):
     return f"Gemini error: {m[:300]}"
 
 
+class GeminiBusy(RuntimeError):
+    """Every model is rate-limited or busy right now — use the passage bank / offline feedback."""
+
+
+@st.cache_resource(show_spinner=False)
+def model_cooldowns():
+    return {}  # model -> time it hit its limit (shared by all students)
+
+
 def ask_gemini(prompt, schema, temperature=0.7):
-    """Structured JSON call with retries and model fallback."""
+    """Structured JSON call. Tries each free model in turn; a model that hit its limit is skipped for a minute."""
     client = get_client()
     if client is None:
         raise RuntimeError("Gemini API key missing — add GEMINI_API_KEY to your secrets.")
@@ -410,9 +458,12 @@ def ask_gemini(prompt, schema, temperature=0.7):
 
     config = types.GenerateContentConfig(
         response_mime_type="application/json", response_schema=schema, temperature=temperature)
-    last = None
+    cool = model_cooldowns()
+    last, busy = None, True
     for model in dict.fromkeys([GEMINI_MODEL] + FALLBACK_MODELS):
-        for attempt in range(3):
+        if time.time() - cool.get(model, 0) < 60:
+            continue
+        for attempt in range(2):
             try:
                 resp = client.models.generate_content(model=model, contents=prompt, config=config)
                 if isinstance(resp.parsed, schema):
@@ -423,21 +474,32 @@ def ask_gemini(prompt, schema, temperature=0.7):
                 last, m = e, str(e)
                 if "API_KEY_INVALID" in m or "API key not valid" in m or "PERMISSION_DENIED" in m:
                     raise RuntimeError(friendly(e))
+                if "429" in m or "RESOURCE_EXHAUSTED" in m:
+                    cool[model] = time.time()
+                    break  # this model's limit is used up → next model
                 if "404" in m or "NOT_FOUND" in m:
-                    break  # model not available → try the next one
-                time.sleep(2 * (attempt + 1))
+                    break
+                if not ("503" in m or "UNAVAILABLE" in m or "overloaded" in m.lower()):
+                    busy = False
+                time.sleep(1.5)
+    if last is None or busy:
+        raise GeminiBusy(friendly(last) if last else "All Gemini models are at their limit right now.")
     raise RuntimeError(friendly(last))
 
 
-def passage_prompt(words, level_idx, topic, focus, avoid_titles, issues):
+def passage_prompt(words, level_idx, topic, focus, avoid_titles, issues, variety):
     lines = [
         "You write reading-comprehension material for first-year B.Com students in Kerala, India. "
         "Many studied in Malayalam-medium schools and are building confidence in English.",
         f"Write ONE original passage of about {words} words (between {int(words * 0.9)} and {int(words * 1.1)} words).",
         f"Difficulty: {LEVEL_NAMES[level_idx]}. {LEVEL_STYLE[level_idx]}",
         f"Theme: {topic['label']} — {topic['brief']}.",
-        "Use Indian English and Kerala settings, places and names (e.g. Kochi, Thrissur, Kozhikode, Palakkad; "
-        "Anu, Rahul, Fathima, Joseph). Use ₹ for money.",
+        f"Use Indian English. Set the passage in or around {variety['place']}. Use ₹ for money.",
+        f"Write it as {variety['format']}. Give it a fresh angle: {variety['angle']}.",
+        f"NAMES: if the passage needs people, use ONLY these first names: {', '.join(variety['names'])}. "
+        "Use first names only — no surnames, no family names, no caste or community names, no religious titles "
+        "or religious references in names. Shops and businesses get neutral names (e.g. 'Green Leaf Bakery', "
+        "'Sunrise Mobiles'), never a person's surname.",
         "Do NOT write a textbook explanation of core commerce or accounting concepts. Write a real-life situation, "
         "short report, profile or story with a problem, a decision, a trend or a disagreement in it — something a "
         "reader can think about, not just remember.",
@@ -549,28 +611,109 @@ def shuffle_mcq(q):
     return {**q, "options": opts, "answer_index": opts.index(correct)}
 
 
-def new_passage(prog):
-    level_idx = prog["level_idx"]
-    words = LEVELS[level_idx]
-    if prog["phase"] == "Diagnostic":
-        topic, focus = DIAGNOSTIC_PLAN[prog["stage"]], None
-    else:
-        topic, focus = PRACTICE_TOPICS[prog["stage"] % len(PRACTICE_TOPICS)], prog["focus"]
-    prompt = passage_prompt(words, level_idx, topic, focus, prog["titles"], prog["issues"])
+def pick_variety():
+    """Random names / place / format / angle so every student gets a different passage."""
+    return {"names": random.sample(NEUTRAL_NAMES, 3), "place": random.choice(KERALA_PLACES),
+            "format": random.choice(FORMATS), "angle": random.choice(ANGLES)}
 
+
+def has_caste_marker(pack):
+    text = " ".join([pack.title, pack.passage, pack.model_answer, pack.q_written,
+                     pack.q_analyse.question, *pack.q_analyse.options, pack.q_vocab.question, *pack.q_vocab.options])
+    return bool(CASTE_RE.search(text))
+
+
+def generate_pack(level_idx, topic, focus, titles, issues):
+    """Ask Gemini for a passage; retry if the length is far off or a name rule is broken."""
+    words = LEVELS[level_idx]
     best, best_gap = None, 9.0
-    for _ in range(2):  # retry once if the length is far off
-        pack = ask_gemini(prompt, PassagePack, temperature=0.9)
+    for _ in range(3):
+        variety = pick_variety()
+        prompt = passage_prompt(words, level_idx, topic, focus, titles, issues, variety)
+        try:
+            pack = ask_gemini(prompt, PassagePack, temperature=1.0)
+        except Exception:
+            if best is not None:
+                break  # keep the good-enough one we already have
+            raise
+        if has_caste_marker(pack):
+            continue
         gap = abs(wc(pack.passage) - words) / words
         if gap < best_gap:
             best, best_gap = pack, gap
         if gap <= 0.2 and len(pack.q_analyse.options) >= 3 and len(pack.q_vocab.options) >= 3:
             break
-    data = best.model_dump()
+    if best is None:
+        raise RuntimeError("Couldn't create a suitable passage this time — please click the button again.")
+    return best.model_dump()
+
+
+def save_to_bank(pack, phase, stage, level_idx, topic, focus):
+    write_row("Bank", {"timestamp": now(), "bank_id": uuid.uuid4().hex[:10], "phase": phase, "stage": stage,
+                       "level_idx": level_idx, "words": LEVELS[level_idx], "topic": topic, "focus": focus or "",
+                       "title": pack["title"], "pack": json.dumps(pack, ensure_ascii=False)})
+
+
+def seen_titles(roll):
+    p, d = read_table("Passages"), read_table("Drafts")
+    seen = set(p[p["roll"] == str(roll)]["title"])
+    for state in d[d["roll"] == str(roll)]["state"]:
+        try:
+            seen.add(json.loads(state)["pack"]["title"])
+        except Exception:
+            pass
+    return seen
+
+
+def from_bank(prog, roll):
+    """Pick a stored passage this student hasn't seen: same level (and same topic if possible)."""
+    bank = read_table("Bank")
+    if bank.empty:
+        return None
+    bank = bank[~bank["title"].isin(seen_titles(roll))].copy()
+    if bank.empty:
+        return None
+    bank["lvl"] = bank["level_idx"].map(num)
+    level = prog["level_idx"]
+    same_level = bank[bank["lvl"] == level]
+    if prog["phase"] == "Diagnostic":
+        best = same_level[(same_level["phase"] == "Diagnostic") & (same_level["stage"].map(num) == prog["stage"])]
+    else:
+        best = same_level[same_level["phase"] == "Practice"]
+    for pool in (best, same_level, bank.loc[(bank["lvl"] - level).abs().sort_values().index[:10]]):
+        if not pool.empty:
+            row = pool.sample(1).iloc[0]
+            try:
+                return json.loads(row["pack"]), row
+            except Exception:
+                continue
+    return None
+
+
+def new_passage(prog):
+    level_idx = prog["level_idx"]
+    if prog["phase"] == "Diagnostic":
+        topic, focus = DIAGNOSTIC_PLAN[prog["stage"]], None
+    else:
+        topic, focus = PRACTICE_TOPICS[prog["stage"] % len(PRACTICE_TOPICS)], prog["focus"]
+    source = "fresh"
+    try:
+        data = generate_pack(level_idx, topic, focus, prog["titles"], prog["issues"])
+        save_to_bank(data, prog["phase"], prog["stage"], level_idx, topic["label"], focus)
+    except Exception as e:
+        if "API key" in str(e):
+            raise
+        found = from_bank(prog, st.session_state.roll)
+        if found is None:
+            raise GeminiBusy("Twin is very busy right now and the passage bank has nothing new for you yet. "
+                             "Please wait a minute and click the button again. 🙏")
+        data, row = found
+        level_idx = int(num(row["level_idx"], level_idx))
+        source = "bank"
     data["q_analyse"], data["q_vocab"] = shuffle_mcq(data["q_analyse"]), shuffle_mcq(data["q_vocab"])
     return {"id": uuid.uuid4().hex[:10], "pack": data, "phase": prog["phase"], "stage": prog["stage"],
-            "attempt": 1, "level_idx": level_idx, "words": words, "topic": topic["label"], "focus": focus,
-            "q": 0, "results": {}, "saved": False, "started": time.time()}
+            "attempt": 1, "level_idx": level_idx, "words": LEVELS[level_idx], "topic": topic["label"],
+            "focus": focus, "source": source, "q": 0, "results": {}, "saved": False, "started": time.time()}
 
 
 def retry_passage(cur):
@@ -629,6 +772,9 @@ def show_mcq_feedback(q, res):
 
 
 def show_written_feedback(res, pack):
+    if res.get("offline"):
+        st.info("⏳ Twin's AI checker is busy right now, so this is a quick offline check of your answer. "
+                "Compare your answer with the model answer below — that's where the real learning happens! 😊")
     smile, _ = mood(res["score"])
     c1, c2, c3 = st.columns(3)
     c1.metric("Thinking", f"{res['thinking']}/10")
@@ -647,6 +793,61 @@ def show_written_feedback(res, pack):
     bubble(f"✨ <b>Your answer, polished:</b><br>{h(fb['improved_answer'])}", "good")
     with st.expander("See a model answer"):
         st.write(md(pack["model_answer"]))
+
+
+REASON_WORDS = ["because", "so ", "therefore", "since", "as a result", "if ", "should", "would", "i think",
+                "i agree", "i disagree", "i believe", "in my opinion", "this shows", "this means", "however"]
+
+
+def offline_feedback(cur, ans):
+    """Rough rule-based feedback used only when every Gemini model is at its limit."""
+    pack, r = cur["pack"], cur["results"]
+    low, words = f" {ans.lower()} ", ans.split()
+    p_words = pack["passage"].lower().split()
+    a_words = [w.strip(".,!?;:'\"").lower() for w in words]
+    content = {w.strip(".,!?;:'\"") for w in p_words if len(w) > 4}
+    used = {w for w in a_words if w in content}
+    copied = any(" ".join(a_words[i:i + 8]) in " ".join(p_words) for i in range(max(len(a_words) - 7, 0)))
+    reasons = [w.strip() for w in REASON_WORDS if w in low]
+
+    think = 3 + (2 if reasons else 0) + (2 if len(used) >= 2 else 0) + (1 if len(words) >= 20 else 0) \
+        + (1 if len(words) >= 35 else 0)
+    if copied:
+        think = min(think, 3)
+    sentences = [x.strip() for x in re.split(r"[.!?]+", ans) if x.strip()]
+    lang = 6 - (0 if ans.strip()[:1].isupper() else 1) - (0 if ans.strip()[-1:] in ".!?" else 1) \
+        - (1 if re.search(r"\bi\b", ans) else 0) + (1 if len(sentences) >= 2 else 0)
+
+    improve = []
+    if not reasons:
+        improve.append("Give a reason with 'because' or 'so' — show WHY you think so.")
+    if len(used) < 2:
+        improve.append("Use evidence: mention a fact or idea from the passage.")
+    if copied:
+        improve.append("Try not to copy sentences — explain the idea in your own words.")
+    if len(words) < 20:
+        improve.append("Write a little more: aim for 3–4 sentences.")
+    mcq_right = sum(1 for i in (0, 1) if r[i]["score"] == 100)
+    tips = [f"Try using '{g['word']}' — it means {g['meaning']}." for g in pack["glossary"][:2]]
+    return WrittenFeedback(
+        thinking_score=max(min(think, 9), 0), language_score=max(min(lang, 8), 3),
+        what_went_well="You wrote your own answer and shared your thinking — that's the most important step!",
+        thinking_feedback=("Good — you gave a reason. " if reasons else "Add a clear reason. ")
+        + ("You used ideas from the passage." if len(used) >= 2 else "Connect your answer to the passage."),
+        grammar_fixes=[], vocabulary_tips=tips,
+        improved_answer="(Twin will polish answers again when the AI checker is free. Compare with the model "
+                        "answer below.)\n\n" + ans,
+        passage_review=PassageReview(
+            twin_message=f"Well done, {first_name()}! 😊 You got {mcq_right} of 2 choice questions right and "
+                         "finished your written answer. Keep going — every passage makes you stronger! 💪",
+            strengths=[s for s in [
+                "You worked out the multiple-choice questions." if mcq_right else "",
+                "You gave a reason for your answer." if reasons else "",
+                "You used ideas from the passage." if len(used) >= 2 else "",
+                "You completed the whole passage."] if s],
+            improve=improve or ["Compare your answer with the model answer and note one new idea or word."],
+            think_deeper="Before answering, ask yourself: what is the writer NOT saying directly?",
+            next_goal="In the next written answer, use 'because' and one fact from the passage."))
 
 
 def render_question(cur, i):
@@ -687,16 +888,20 @@ def render_question(cur, i):
                     st.warning("Please write at least one full sentence that explains your thinking.")
                     return
                 with st.spinner(f"{TWIN} Twin is reading your answer..."):
+                    offline = False
                     try:
                         fb = ask_gemini(scoring_prompt(cur, ans), WrittenFeedback, 0.4)
                     except Exception as e:
-                        st.error(str(e) if isinstance(e, RuntimeError) else friendly(e))
-                        return
+                        if "API key" in str(e):
+                            st.error(str(e))
+                            return
+                        fb, offline = offline_feedback(cur, ans), True
                 think = min(max(fb.thinking_score, 0), 10)
                 lang = min(max(fb.language_score, 0), 10)
                 full = fb.model_dump()
                 res = {"score": round(think * 7 + lang * 3), "thinking": think, "language": lang,
-                       "feedback": fb.thinking_feedback, "full": full, "response": ans,
+                       "feedback": ("[offline estimate] " if offline else "") + fb.thinking_feedback,
+                       "full": full, "response": ans, "offline": offline,
                        "grammar_fixes": " | ".join(f"{g['error']} → {g['correction']}" for g in full["grammar_fixes"]),
                        "rules": "; ".join(g["rule"] for g in full["grammar_fixes"]),
                        "vocab_tips": " | ".join(full["vocabulary_tips"])}
@@ -868,6 +1073,7 @@ def student_page():
 
     pack = cur["pack"]
     retry = f" · attempt {cur['attempt']}" if cur.get("attempt", 1) > 1 else ""
+    retry += " · 📦 from the passage bank" if cur.get("source") == "bank" else ""
     st.caption(f"{cur['phase']} · {cur['topic']} · {wc(pack['passage'])} words{retry}")
     st.subheader(md(pack["title"]))
 
@@ -970,6 +1176,40 @@ def teacher_page():
                 st.markdown(f"<div class='passage-box'>{h(p[p['title'] == t].iloc[0]['passage'])}</div>",
                             unsafe_allow_html=True)
 
+    st.subheader("📦 Passage bank")
+    bank = read_table("Bank")
+    if bank.empty:
+        st.caption("The bank is empty. Every new passage is saved here automatically.")
+    else:
+        counts = bank["words"].map(lambda w: f"{w} words").value_counts().reindex(
+            [f"{w} words" for w in LEVELS], fill_value=0)
+        st.caption(f"{len(bank)} passages saved. When Gemini is at its limit, students get one of these "
+                   "(never one they've already done).")
+        st.bar_chart(counts.rename("Passages"))
+    st.markdown("Stock up the bank at a quiet time (e.g. the evening before class). Each passage uses one "
+                "Gemini request, spread evenly over the six levels.")
+    n = st.number_input("How many passages to add?", min_value=1, max_value=60, value=12, step=6)
+    if st.button("➕ Fill the passage bank"):
+        bar, added = st.progress(0.0, text="Starting..."), 0
+        for i in range(int(n)):
+            level = i % len(LEVELS)
+            if (i // len(LEVELS)) % 2 == 0:
+                phase, stage, topic = "Diagnostic", level, DIAGNOSTIC_PLAN[level]
+            else:
+                phase, stage, topic = "Practice", 0, random.choice(PRACTICE_TOPICS)
+            try:
+                titles = read_table("Bank")["title"].tolist()
+                pack = generate_pack(level, topic, None, titles, "")
+            except Exception as e:
+                st.warning(f"Stopped after {added} passage(s) — Gemini needs a rest. Try again in a few minutes. ({e})")
+                break
+            save_to_bank(pack, phase, stage, level, topic["label"], None)
+            added += 1
+            bar.progress((i + 1) / n, text=f"Added {added} of {int(n)} — {LEVELS[level]} words: {pack['title']}")
+            time.sleep(4)  # stay under the free per-minute limit
+        else:
+            st.success(f"Done! {added} passages added. The bank now has {len(read_table('Bank'))} passages. 🎉")
+
     st.subheader("Download")
     d1, d2, d3, d4 = st.columns(4)
     d1.download_button("⬇️ Summary", summary.to_csv(index=False), "summary.csv", "text/csv")
@@ -987,7 +1227,7 @@ def login_page():
     s_tab, t_tab = st.tabs(["📝 Student", "🔑 Teacher"])
     with s_tab:
         with st.form("student_login"):
-            roll = st.text_input("Roll Number").strip()
+            roll = clean_roll(st.text_input("Roll Number (e.g. CB01025)"))
             name = st.text_input("Full Name")
             if st.form_submit_button("Enter 🚀", type="primary"):
                 clean = " ".join(name.split()).lower()

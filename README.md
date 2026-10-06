@@ -30,8 +30,16 @@ The Google Sheet gets these tabs automatically:
 | Passages | One row per completed passage with all skill scores. |
 | Attempts | Every answer with its score and feedback. |
 | Drafts | Unfinished passages, used for resume. |
+| Bank | Every passage ever generated, reused when Gemini is at its free limit. |
 
 The in-app dashboard shows the same, plus charts, each student's answers, and CSV downloads.
+
+## Staying on the free tier
+
+- **Six free Gemini models in turn:** if one hits its limit, the app moves to the next (each has its own free limit). A model that hit its limit is skipped for a minute.
+- **Passage bank:** every new passage is saved to the Bank tab. When all models are at their limit, a student gets a bank passage at their level that they have never done.
+- **Offline answer check:** if no model is free when a written answer is submitted, the app gives a quick rule-based check and the model answer, marked "[offline estimate]" in the Sheet.
+- **Fill the bank in advance:** Teacher dashboard → Passage bank → *Fill the passage bank* (e.g. the evening before class).
 
 ## Setup
 
