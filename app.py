@@ -46,7 +46,7 @@ def clean_roll(r):
     return str(r).strip().upper().replace(" ", "")
 
 
-ROSTER = {clean_roll(k): str(v).strip() for k, v in dict(secret("roster", DEFAULT_ROSTER)).items()}
+ROSTER_SECRETS = {clean_roll(k): str(v).strip() for k, v in dict(secret("roster", {})).items()}
 TEACHER_PASSWORD = str(secret("TEACHER_PASSWORD", "admin123"))
 GEMINI_MODEL = str(secret("GEMINI_MODEL", "gemini-3.5-flash-lite"))
 # All of these have a free tier, each with its own separate limit.
@@ -233,6 +233,21 @@ class LocalStore:
             return pd.DataFrame(columns=TABLES[table])
         return pd.read_csv(path, dtype=str, keep_default_na=False)
 
+    def read_roster(self):
+        path = self.folder / "Roster.csv"
+        if not path.exists():
+            return {}
+        return roster_from_rows(pd.read_csv(path, dtype=str, keep_default_na=False, header=None).values.tolist())
+
+
+def roster_from_rows(rows):
+    out = {}
+    for row in rows:
+        vals = [str(v).strip() for v in row]
+        if len(vals) >= 2 and vals[0] and vals[1] and not vals[0].lower().startswith("roll"):
+            out[clean_roll(vals[0])] = vals[1]
+    return out
+
 
 class SheetStore:
     """One Google Sheet; the app creates the tabs it needs."""
@@ -263,6 +278,17 @@ class SheetStore:
     def read(self, table):
         records = self._sheet(table).get_all_records(numericise_ignore=["all"])
         return pd.DataFrame(records, columns=TABLES[table]).astype(str)
+
+    def read_roster(self):
+        """A 'Roster' tab: Roll Number in column A, Full Name in column B (one student per row)."""
+        import gspread
+        try:
+            ws = self.sh.worksheet("Roster")
+        except gspread.WorksheetNotFound:
+            ws = self.sh.add_worksheet(title="Roster", rows=300, cols=2, index=0)
+            ws.update(range_name="A1", values=[["Roll Number", "Full Name"]])
+            return {}
+        return roster_from_rows(ws.get_all_values())
 
     def build_summary(self, roster):
         """A 'Summary' tab with live formulas: times entered, passages completed, etc. per student."""
@@ -295,24 +321,74 @@ class SheetStore:
         ws.update(range_name="A1", values=rows, value_input_option="USER_ENTERED")
 
 
+def parse_service_account(sa):
+    """Accept the pasted JSON file (string) or a TOML table; explain clearly what is wrong."""
+    if not isinstance(sa, str):
+        return dict(sa)
+    text = sa.strip().lstrip("﻿")
+    if not text:
+        raise ValueError("gcp_service_account in Secrets is EMPTY. Paste the whole JSON key file "
+                         "(from { to }) between the triple-quote lines.")
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        hint = "only an email address" if "@" in text and len(text) < 120 else "no { ... } block"
+        raise ValueError(f"gcp_service_account in Secrets contains {hint}. Open the .json key file in "
+                         "Notepad, press Ctrl+A, Ctrl+C and paste ALL of it between the triple-quote lines.")
+    try:
+        info = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"The pasted JSON key is incomplete or was changed (problem near line {e.lineno}). "
+                         "Delete it and paste the whole file again from Notepad.")
+    missing = [k for k in ("private_key", "client_email", "token_uri") if k not in info]
+    if missing:
+        raise ValueError(f"The pasted JSON key is missing: {', '.join(missing)}. Paste the WHOLE file.")
+    return info
+
+
+def explain_sheet_error(e):
+    name, msg = type(e).__name__, str(e)
+    if name == "SpreadsheetNotFound" or "404" in msg or "not found" in msg.lower():
+        return ("No Google Sheet found with this SHEET_ID. Copy the ID again from the Sheet's address bar "
+                "(the part between /d/ and /edit) into Secrets.")
+    if isinstance(e, PermissionError) or "403" in msg or "PERMISSION_DENIED" in msg:
+        if "has not been used" in msg or "is disabled" in msg:
+            return ("The Google Sheets API is not enabled in the Cloud project of this service account. "
+                    "Enable 'Google Sheets API' in console.cloud.google.com for that project.")
+        return ("The app is not allowed to open this Sheet. Open the Sheet → Share → add the client_email "
+                "from your JSON key as Editor.")
+    if "invalid_grant" in msg or "Invalid JWT" in msg:
+        return "The JSON key is no longer valid (maybe deleted). Create a new key and paste it into Secrets."
+    return f"{name}: {msg}" if msg else name
+
+
 @st.cache_resource(show_spinner=False)
 def get_store():
     sa, sheet_id = secret("gcp_service_account"), secret("SHEET_ID")
     if sa and sheet_id:
         try:
             import gspread
-            # Accept either the pasted JSON file (as a string) or a TOML table
-            info = json.loads(sa) if isinstance(sa, str) else dict(sa)
+            info = parse_service_account(sa)
             gc = gspread.service_account_from_dict(info)
             store = SheetStore(gc.open_by_key(str(sheet_id)))
             try:
-                store.build_summary(ROSTER)
+                store.build_summary({**store.read_roster(), **ROSTER_SECRETS} or DEFAULT_ROSTER)
             except Exception as e:
                 return store, "Google Sheets", f"Summary tab not built: {e}"
             return store, "Google Sheets", None
         except Exception as e:
-            return LocalStore(), "Local CSV (Sheets failed)", str(e)
+            return LocalStore(), "Local CSV (Sheets failed)", explain_sheet_error(e)
     return LocalStore(), "Local CSV", None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_roster():
+    """Students allowed to log in: the Sheet's Roster tab plus any [roster] in Secrets."""
+    try:
+        roster = dict(get_store()[0].read_roster())
+    except Exception:
+        roster = {}
+    roster.update(ROSTER_SECRETS)
+    return roster or DEFAULT_ROSTER
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1102,12 +1178,32 @@ def teacher_page():
                + (" · the Sheet's **Summary** tab updates by itself" if store_name == "Google Sheets" else ""))
     if store_err:
         st.error(f"Google Sheets problem: {store_err}")
+        sa = secret("gcp_service_account")
+        if sa:
+            try:
+                email = parse_service_account(sa).get("client_email", "")
+                st.info(f"Also make sure your Google Sheet is shared (as Editor) with: **{email}**")
+            except Exception:
+                pass
+    if store_name != "Google Sheets" and st.button("🔌 Reconnect to Google Sheets (after fixing Secrets)"):
+        get_store.clear()
+        get_roster.clear()
+        read_table.clear()
+        st.rerun()
     if TEACHER_PASSWORD == "admin123":
         st.warning("You're using the default teacher password. Set TEACHER_PASSWORD in secrets.")
     if st.button("🔄 Refresh data"):
         read_table.clear()
         st.rerun()
 
+    ROSTER = get_roster()
+    if st.button("👥 Refresh class list (after editing the Roster tab)"):
+        get_roster.clear()
+        try:
+            get_store()[0].build_summary(get_roster())
+        except Exception as e:
+            st.warning(f"Summary tab not rebuilt: {e}")
+        st.rerun()
     att, pas, logs = read_table("Attempts"), read_table("Passages"), read_table("Logins")
     for c in ["passage_score", *SKILLS, "level_idx", "next_level_idx", "stage", "duration_min"]:
         pas[c] = pd.to_numeric(pas[c], errors="coerce")
@@ -1231,6 +1327,7 @@ def login_page():
             name = st.text_input("Full Name")
             if st.form_submit_button("Enter 🚀", type="primary"):
                 clean = " ".join(name.split()).lower()
+                ROSTER = get_roster()
                 if roll in ROSTER and " ".join(ROSTER[roll].split()).lower() == clean:
                     st.session_state.pop("bye", None)
                     st.session_state.update(role="student", roll=roll, name=ROSTER[roll], current=None,
