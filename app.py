@@ -46,6 +46,31 @@ def clean_roll(r):
     return str(r).strip().upper().replace(" ", "")
 
 
+def loose_roll(r):
+    """CB01, cb-1, CB 001 -> CB1 (ignores case, spaces, punctuation and leading zeros)."""
+    s = re.sub(r"[^A-Z0-9]", "", clean_roll(r))
+    return re.sub(r"\d+", lambda m: str(int(m.group())), s)
+
+
+def loose_name(n):
+    """'Abhirami P.S.' and 'ABHIRAMI  P S' both become 'abhiramips'."""
+    return re.sub(r"[^a-z]", "", str(n).lower())
+
+
+def find_student(roster, roll, name):
+    """Return the roster roll number if roll + name match (tolerant), else None."""
+    want = loose_roll(roll)
+    for key, full in roster.items():
+        if loose_roll(key) != want:
+            continue
+        typed, real = loose_name(name), loose_name(full)
+        first_typed = loose_name(str(name).split()[0]) if str(name).split() else ""
+        first_real = loose_name(str(full).split()[0]) if str(full).split() else ""
+        if typed and (typed == real or (first_typed and first_typed == first_real)):
+            return key
+    return None
+
+
 ROSTER_SECRETS = {clean_roll(k): str(v).strip() for k, v in dict(secret("roster", {})).items()}
 TEACHER_PASSWORD = str(secret("TEACHER_PASSWORD", "admin123"))
 GEMINI_MODEL = str(secret("GEMINI_MODEL", "gemini-3.5-flash-lite"))
@@ -273,7 +298,7 @@ class SheetStore:
             v = row.get(c, "")
             # numbers stay numbers (so Sheets can average them); everything else is plain text
             cells.append(v if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)[:45000])
-        self._sheet(table).append_row(cells, value_input_option="RAW")
+        _retry(lambda: self._sheet(table).append_row(cells, value_input_option="RAW"))
 
     def read(self, table):
         records = self._sheet(table).get_all_records(numericise_ignore=["all"])
@@ -380,20 +405,65 @@ def get_store():
     return LocalStore(), "Local CSV", None
 
 
+@st.cache_resource(show_spinner=False)
+def _last_good():
+    return {}  # last successful copy of each table / the roster, shared by all students
+
+
+@st.cache_resource(show_spinner=False)
+def _versions():
+    return {}  # table -> version number; bumped when that table is written
+
+
+def _retry(fn, tries=3):
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception:
+            if i == tries - 1:
+                raise
+            time.sleep(1.5 * (i + 1))
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def get_roster():
     """Students allowed to log in: the Sheet's Roster tab plus any [roster] in Secrets."""
+    store = get_store()[0]
     try:
-        roster = dict(get_store()[0].read_roster())
+        roster = dict(_retry(store.read_roster))
     except Exception:
-        roster = {}
+        if _last_good().get("roster"):
+            return _last_good()["roster"]
+        if isinstance(store, LocalStore):
+            roster = {}
+        else:
+            raise RuntimeError("The class list could not be loaded right now.")
     roster.update(ROSTER_SECRETS)
+    if roster:
+        _last_good()["roster"] = roster
     return roster or DEFAULT_ROSTER
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def read_table(table):
+def _read_table(table, version):
     return get_store()[0].read(table)
+
+
+def read_table(table):
+    """Cached read; falls back to the last good copy if Google Sheets is busy."""
+    try:
+        df = _retry(lambda: _read_table(table, _versions().get(table, 0)))
+        _last_good()[table] = df
+        return df
+    except Exception:
+        if table in _last_good():
+            return _last_good()[table]
+        raise
+
+
+def clear_cache():
+    _read_table.clear()
+    get_roster.clear()
 
 
 def write_row(table, row):
@@ -409,7 +479,8 @@ def write_row(table, row):
             remaining.append((t, r))
             st.toast(f"Couldn't save to {t} yet — will retry. ({str(e)[:80]})", icon="⚠️")
     st.session_state.unsaved = remaining
-    read_table.clear()
+    v = _versions()
+    v[table] = v.get(table, 0) + 1  # only this table is re-read next time
 
 
 def log_event(event, detail=""):
@@ -1100,7 +1171,13 @@ def twin_welcome(prog):
 
 def student_page():
     if "progress" not in st.session_state:
-        st.session_state.progress = load_progress(st.session_state.roll)
+        try:
+            st.session_state.progress = load_progress(st.session_state.roll)
+        except Exception:
+            st.warning("⏳ Twin is loading your record — the class list is busy. Please wait 30 seconds and "
+                       "press the button below.")
+            st.button("🔄 Try again")
+            st.stop()
         draft = pending_draft(st.session_state.roll)
         st.session_state.draft = draft
     prog = st.session_state.progress
@@ -1187,18 +1264,17 @@ def teacher_page():
                 pass
     if store_name != "Google Sheets" and st.button("🔌 Reconnect to Google Sheets (after fixing Secrets)"):
         get_store.clear()
-        get_roster.clear()
-        read_table.clear()
+        clear_cache()
         st.rerun()
     if TEACHER_PASSWORD == "admin123":
         st.warning("You're using the default teacher password. Set TEACHER_PASSWORD in secrets.")
     if st.button("🔄 Refresh data"):
-        read_table.clear()
+        clear_cache()
         st.rerun()
 
     ROSTER = get_roster()
     if st.button("👥 Refresh class list (after editing the Roster tab)"):
-        get_roster.clear()
+        clear_cache()
         try:
             get_store()[0].build_summary(get_roster())
         except Exception as e:
@@ -1272,6 +1348,15 @@ def teacher_page():
                 st.markdown(f"<div class='passage-box'>{h(p[p['title'] == t].iloc[0]['passage'])}</div>",
                             unsafe_allow_html=True)
 
+    failed = logs[logs["event"] == "failed"]
+    with st.expander(f"🔐 Failed login attempts ({len(failed)})"):
+        if failed.empty:
+            st.caption("No failed logins yet.")
+        else:
+            st.caption("What students typed. Fix spellings in the Roster tab, then click 👥 Refresh class list.")
+            st.dataframe(failed[["timestamp", "roll", "name", "detail"]].iloc[::-1], width="stretch",
+                         hide_index=True)
+
     st.subheader("📦 Passage bank")
     bank = read_table("Bank")
     if bank.empty:
@@ -1323,19 +1408,31 @@ def login_page():
     s_tab, t_tab = st.tabs(["📝 Student", "🔑 Teacher"])
     with s_tab:
         with st.form("student_login"):
-            roll = clean_roll(st.text_input("Roll Number (e.g. CB01025)"))
+            roll_in = st.text_input("Roll Number (e.g. CB05)")
             name = st.text_input("Full Name")
             if st.form_submit_button("Enter 🚀", type="primary"):
-                clean = " ".join(name.split()).lower()
-                ROSTER = get_roster()
-                if roll in ROSTER and " ".join(ROSTER[roll].split()).lower() == clean:
+                try:
+                    ROSTER = get_roster()
+                except Exception:
+                    st.warning("⏳ The class list is busy loading. Please wait 30 seconds and press Enter again.")
+                    st.stop()
+                roll = find_student(ROSTER, roll_in, name)
+                if roll:
                     st.session_state.pop("bye", None)
                     st.session_state.update(role="student", roll=roll, name=ROSTER[roll], current=None,
                                             session_id=uuid.uuid4().hex[:8], visit_done=0)
                     log_event("login")
                     st.rerun()
                 else:
-                    st.error("Roll number and name don't match the class list.")
+                    known = any(loose_roll(k) == loose_roll(roll_in) for k in ROSTER)
+                    write_row("Logins", {"timestamp": now(), "roll": roll_in.strip(), "name": name.strip(),
+                                         "event": "failed", "session_id": "",
+                                         "detail": "name did not match" if known else "roll number not in list"})
+                    if known:
+                        st.error("That roll number is in the class list, but the name doesn't match. "
+                                 "Type your first name as it appears in the class list, then try again.")
+                    else:
+                        st.error("This roll number is not in the class list. Check it (e.g. CB05) or ask your teacher.")
     with t_tab:
         with st.form("teacher_login"):
             pw = st.text_input("Password", type="password")
